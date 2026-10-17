@@ -1,11 +1,12 @@
 name = "mailer-worker"
 main = "src/index.ts"
-compatibility_date = "2022-08-04"
+account_id = "3ef6bdbd5647b3f05c7b4d95bda51111"
+compatibility_date = "2026-10-01"
+
+# Secrets (set via dashboard or `wrangler secret put`):
+#   MAILGUN_API_KEY  - "api:<key>" (sent as HTTP Basic auth)
+#   TURNSTILE_SECRET - Turnstile widget secret key
 
 [[kv_namespaces]]
-  binding = "BANNED_IPs"
-  id = "c70cd2c47f454c59b63318210ad05ff6"
-
-[[kv_namespaces]]
-  binding = "ALLOWED"
-  id = "f6eb7abf2b6f4d9db57d9136645bbcc1"
+binding = "ALLOWED"
+id = "f6eb7abf2b6f4d9db57d9136645bbcc1"

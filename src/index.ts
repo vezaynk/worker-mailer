@@ -1,152 +1,166 @@
 export interface Env {
-  BANNED_IPs: KVNamespace;
   ALLOWED: KVNamespace;
   MAILGUN_API_KEY: string;
+  TURNSTILE_SECRET: string;
 }
 
-const sendPattern = new URLPattern({ pathname: "/send" });
-const blockPattern = new URLPattern({ pathname: "/block/:ip" });
-const unblockPattern = new URLPattern({ pathname: "/unblock/:ip" });
-const listBlockPattern = new URLPattern({ pathname: "/blocklist" });
+const ALLOWED_ORIGINS = new Set([
+  "https://knyazev.io",
+  "https://www.knyazev.io",
+]);
+const ALLOWED_HOSTNAMES = new Set(["knyazev.io", "www.knyazev.io"]);
+const SITEVERIFY_URL =
+  "https://challenges.cloudflare.com/turnstile/v0/siteverify";
+const MAILGUN_URL = "https://api.mailgun.net/v3/mg.knyazev.io/messages";
+
+interface SiteverifyResult {
+  success: boolean;
+  hostname?: string;
+  "error-codes"?: string[];
+  action?: string;
+  challenge_ts?: string;
+}
+
+function corsHeaders(request: Request): Record<string, string> {
+  const origin = request.headers.get("Origin");
+  const headers: Record<string, string> = { Vary: "Origin" };
+  if (origin && ALLOWED_ORIGINS.has(origin)) {
+    headers["Access-Control-Allow-Origin"] = origin;
+    headers["Access-Control-Allow-Methods"] = "POST, OPTIONS";
+    headers["Access-Control-Allow-Headers"] = "Content-Type";
+    headers["Access-Control-Max-Age"] = "86400";
+  }
+  return headers;
+}
+
+function json(
+  request: Request,
+  status: number,
+  body: { ok: true } | { ok: false; error: string },
+  extra: Record<string, string> = {}
+): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      "Content-Type": "application/json;charset=UTF-8",
+      ...corsHeaders(request),
+      ...extra,
+    },
+  });
+}
+
+async function verifyTurnstile(
+  token: string,
+  secret: string,
+  remoteip: string | null
+): Promise<SiteverifyResult> {
+  const body = new URLSearchParams({ secret, response: token });
+  if (remoteip) body.set("remoteip", remoteip);
+  const res = await fetch(SITEVERIFY_URL, { method: "POST", body });
+  if (!res.ok) return { success: false, "error-codes": [`http-${res.status}`] };
+  return (await res.json()) as SiteverifyResult;
+}
+
+async function handleSend(request: Request, env: Env): Promise<Response> {
+  let formData: FormData;
+  try {
+    formData = await request.formData();
+  } catch {
+    return json(request, 400, { ok: false, error: "Invalid form data" });
+  }
+
+  const field = (name: string) => formData.get(name)?.toString().trim() || "";
+  const token = field("cf-turnstile-response");
+  const senderName = field("name");
+  const senderContact = field("contact");
+  const messageBody = field("body");
+  const messageTitle = field("subject") || senderName;
+  const selectedTo = field("to");
+  const senderIP = request.headers.get("CF-Connecting-IP");
+
+  if (!token) {
+    return json(request, 403, { ok: false, error: "Captcha verification failed" });
+  }
+  if (!env.TURNSTILE_SECRET) {
+    console.error("TURNSTILE_SECRET is not configured");
+    return json(request, 500, { ok: false, error: "Server misconfigured" });
+  }
+
+  const verification = await verifyTurnstile(
+    token,
+    env.TURNSTILE_SECRET,
+    senderIP
+  );
+  if (
+    !verification.success ||
+    !verification.hostname ||
+    !ALLOWED_HOSTNAMES.has(verification.hostname)
+  ) {
+    console.log("Turnstile rejected", JSON.stringify(verification));
+    return json(request, 403, { ok: false, error: "Captcha verification failed" });
+  }
+
+  if (!senderName || !senderContact || !messageBody || !selectedTo) {
+    return json(request, 400, { ok: false, error: "Missing required fields" });
+  }
+
+  const to = await env.ALLOWED.get(selectedTo);
+  if (!to) {
+    return json(request, 400, { ok: false, error: "No such contact" });
+  }
+
+  const mail = new URLSearchParams({
+    from: "contact@mg.knyazev.io",
+    to,
+    subject: `Message from website ${messageTitle}`,
+    template: "contact-message",
+    "v:title": messageTitle,
+    "v:message": messageBody,
+    "v:name": senderName,
+    "v:contact": senderContact,
+    "v:ip": senderIP ?? "unknown",
+  });
+  if (senderContact.includes("@")) mail.set("h:Reply-To", senderContact);
+
+  const mailRes = await fetch(MAILGUN_URL, {
+    method: "POST",
+    headers: {
+      Authorization: "Basic " + btoa(env.MAILGUN_API_KEY),
+    },
+    body: mail,
+  });
+
+  if (!mailRes.ok) {
+    console.error("Mailgun error", mailRes.status, await mailRes.text());
+    return json(request, 502, { ok: false, error: "Could not send message" });
+  }
+
+  return json(request, 200, { ok: true });
+}
 
 export default {
-  fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    return new Promise((resolve) => {
-      async function safeOperation(
-        operation: () => Promise<Response>
-      ): Promise<Response> {
-        if (request.method == "POST") {
-          return operation();
-        } else {
-          return new Response(
-            `
-          <form method="POST">
-            <button type="submit">Complete operation</button>
-          </form>
-          <script>
-            document.querySelector("form").submit();
-          </script>
-        `,
-            {
-              headers: {
-                "content-type": "text/html;charset=UTF-8",
-              },
-            }
-          );
-        }
+  async fetch(request: Request, env: Env): Promise<Response> {
+    try {
+      const { pathname } = new URL(request.url);
+
+      if (pathname !== "/send") {
+        return json(request, 404, { ok: false, error: "Not found" });
       }
-      async function registerRoute(
-        pattern: URLPattern,
-        handler: (pattern: URLPatternURLPatternResult) => Promise<Response>
-      ) {
-        if (pattern.test(request.url)) {
-          const result = pattern.exec(request.url);
-          if (!result) throw new Error("Pattern does not match itself");
-          resolve(handler(result));
-        }
+      if (request.method === "OPTIONS") {
+        return new Response(null, { status: 204, headers: corsHeaders(request) });
       }
-      registerRoute(sendPattern, async () => {
-        const originIP = request.headers.get("CF-Connecting-IP");
-        const overrideIP = request.headers.get("Override-Connecting-IP");
-        if (overrideIP) {
-          console.log("Overriding IP", overrideIP);
-        }
-        const senderIP = overrideIP ?? originIP;
-
-        const formData = await request.formData();
-
-        const senderName = formData.get("name")?.toString();
-        const senderContact = formData.get("contact")?.toString();
-        const messageBody = formData.get("body")?.toString();
-        const messageTitle = formData.get("subject")?.toString() ?? senderName;
-        const selectedTo = formData.get("to")?.toString();
-        const replyTo = senderContact?.includes("@")
-          ? senderContact
-          : undefined;
-
-        console.log("originIP", originIP);
-        console.log("overrideIP", overrideIP);
-        console.log("senderContact", senderContact);
-        console.log("messageBody", messageBody);
-        console.log("messageTitle", messageTitle);
-        console.log("selectedTo", selectedTo);
-        console.log("replyTo", replyTo);
-
-        if (
-          !senderIP ||
-          !senderName ||
-          !senderContact ||
-          !messageTitle ||
-          !messageBody ||
-          !selectedTo
-        )
-          throw new Error("Missing Data");
-
-        const to = await env.ALLOWED.get(selectedTo);
-        if (!selectedTo) throw new Error("No such contact");
-
-        const isBanned = (await env.BANNED_IPs.get(senderIP)) == "BAN";
-        if (isBanned) throw new Error(`${senderIP} is banned`);
-
-        await fetch("https://api.mailgun.net/v3/mg.knyazev.io/messages", {
-          headers: {
-            Authorization: "Basic " + btoa(env.MAILGUN_API_KEY).toString(),
-            "Content-Type": "application/x-www-form-urlencoded",
-          },
-          body: encodeURI(
-            `from=contact@mg.knyazev.io&to=${to}&subject=Message from website ${messageTitle}&template=contact-message&v:title=${messageTitle}&v:message=${messageBody}&v:name=${senderName}&v:contact=${senderContact}&v:ip=${senderIP}`
-          ),
-          method: "POST",
-        });
-
-        return new Response("Message sent");
-      });
-
-      registerRoute(
-        blockPattern,
-        async ({
-          pathname: {
-            groups: { ip },
-          },
-        }) => {
-          return safeOperation(async () => {
-            if (ip) env.BANNED_IPs.put(ip, "BAN");
-            return new Response(`Banned ${ip} from sending mail`);
-          });
-        }
-      );
-      registerRoute(
-        unblockPattern,
-        async ({
-          pathname: {
-            groups: { ip },
-          },
-        }) => {
-          return safeOperation(async () => {
-            if (ip) env.BANNED_IPs.put(ip, "ALLOW");
-
-            return new Response(`Unbanned ${ip} from sending mail`);
-          });
-        }
-      );
-      registerRoute(listBlockPattern, async () => {
-        const bannedIPs = await env.BANNED_IPs.list();
-        const table = await Promise.all(
-          bannedIPs.keys
-            .map((k) => k.name)
-            .map(async (key) => ({
-              key,
-              value: await env.BANNED_IPs.get(key),
-            }))
+      if (request.method !== "POST") {
+        return json(
+          request,
+          405,
+          { ok: false, error: "Method not allowed" },
+          { Allow: "POST, OPTIONS" }
         );
-
-        const stringified = table
-          .map((kv) => `${kv.key} ${kv.value}`)
-          .join("\n");
-
-        return new Response(stringified);
-      });
-    });
+      }
+      return await handleSend(request, env);
+    } catch (err) {
+      console.error("Unhandled error", err instanceof Error ? err.stack : err);
+      return json(request, 500, { ok: false, error: "Internal error" });
+    }
   },
 };
-
